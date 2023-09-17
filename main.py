@@ -247,7 +247,8 @@ while True:
                         time.sleep(5)
                         logging.info(f"For instance {inst_info(offer)})")
                         create_instance(id=offer['id'], price=offer['bid'], disk=args.disk_space, image=args.image, args=args.args.split(" "))
-            
+                        break
+                        
             if not swapped:
                 # Check for duplicates
                 machine_ids = {}
