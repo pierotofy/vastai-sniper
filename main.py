@@ -21,6 +21,10 @@ parser.add_argument('--max-bid',
     type=float,
     default=0.06,
     help='Maximum hourly bid. Default: %(default)s')
+parser.add_argument('--bid-spread',
+    type=float,
+    default=0.00,
+    help='Bid this amount over minimum. Default: %(default)s')
 parser.add_argument('--bid-type',
     type=str,
     choices=("bid", "on-demand"),
@@ -45,7 +49,13 @@ parser.add_argument('--disk-space',
     type=float,
     default=10.0,
     help='Disk space to allocate in GB. Default: %(default)s')
+parser.add_argument('--gpu-blacklist',
+    type=str,
+    default="",
+    help='Blacklist of GPUs (comma separated). Default: %(default)s')
+
 args = parser.parse_args()
+gpu_blacklist = [n.lower() for n in args.gpu_blacklist.split(",")]
 
 if os.path.exists(api_key_file):
     with open(api_key_file, "r") as reader:
@@ -88,7 +98,7 @@ def capture_json(func):
         res = f.getvalue()
         try:
             return json.loads(res)
-        except:
+        except Exception as e:
             return {}
     return wrapper
 
@@ -102,28 +112,63 @@ destroy_instance = capture_json(destroy__instance)
 def compute_bid(offers):
     for o in offers:
         # Compute bid
-        o['bid'] = o['min_bid'] + (args.disk_space * o['storage_cost'] / 30 / 24) + 0.02
-        # TODO: make spread a var?
+        o['bid'] = o['min_bid'] + (args.disk_space * o['storage_cost'] / 30 / 24) + args.bid_spread
     return offers
 
+def filter_instances(offers):
+    machine_ids = {}
+    host_ids = {}
+    tmp = []
+
+    # Filter duplicates, expensive, bogus instances
+    for o in offers:
+        if o['bid'] > args.max_bid:
+            continue
+        if o['machine_id'] in machine_ids:
+            continue
+        if o['host_id'] in host_ids:
+            continue
+        if o['bid'] < 0.01:
+            continue
+        
+        blacklisted = False
+        for bg in gpu_blacklist:
+            if bg in o['gpu_name'].lower():
+                blacklisted = True
+                break
+        
+        if blacklisted:
+            continue
+
+        machine_ids[o['machine_id']] = True
+        host_ids[o['host_id']] = True
+        
+        tmp.append(o)
+
+    return tmp
+
+def inst_info(inst):
+    return f"{inst['id']} (m: {inst['machine_id']} c: {inst['gpu_name']} g: {inst['geolocation']} bid: ${inst.get('bid', 'N/A')})"
+
+
+def run_instances(instances):
+    return [i for i in instances if i['actual_status'] == 'running' or i['actual_status'] is None]
+        
 while True:
     try:
         my_instances = compute_bid(show_instances())
+        my_machine_ids = [i['machine_id'] for i in my_instances]
+        my_host_ids = [i['host_id'] for i in my_instances]
+        instance_count = len(run_instances(my_instances))
 
-        run_instances = [i for i in my_instances if i['actual_status'] == 'running' or i['actual_status'] is None]
-        instance_count = len(run_instances)
-
-        # TODO: remove duplicate machine IDs!!
+        offers = compute_bid(search_offers(type="bid", query=f"rentable=true rented=true disk_space >= {args.disk_space} min_bid <= {args.max_bid}  {args.query}"))
+        offers.sort(key=lambda o: o['bid'])
+        offers = filter_instances(offers)
         
         if instance_count < args.max_instances:
-            offers = compute_bid(search_offers(type="bid", query=f"rentable=true rented=true disk_space >= {args.disk_space} min_bid < {args.max_bid}  {args.query}"))
-            offers.sort(key=lambda o: o['bid'])
-            
             created_count = 0
             created_target = args.max_instances - instance_count
             for offer in offers:
-                if offer['bid'] > args.max_bid:
-                    continue
                 if created_count >= created_target:
                     break
 
@@ -136,13 +181,12 @@ while True:
                             pass
                         elif inst['actual_status'] != 'running':
                             # Update bid
-                            logging.info(f"Updating bid (m: {offer['machine_id']} c: {offer['gpu_name']} g: {offer['geolocation']} bid: ${offer['bid']})")
+                            logging.info(f"Updating bid {inst_info(offer)})")
                             change_bid(id=inst['id'], price=offer['bid'])
                             time.sleep(2)
-                        # TODO: update bid to lower cost?
                 if not found:
                     # Create
-                    logging.info(f"Creating instance {offer['id']} (m: {offer['machine_id']} c: {offer['gpu_name']} g: {offer['geolocation']} bid: ${offer['bid']})")
+                    logging.info(f"Creating instance {inst_info(offer)})")
 
                     create_instance(id=offer['id'], price=offer['bid'], disk=args.disk_space, image=args.image, args=args.args.split(" "))
                     created_count += 1
@@ -152,16 +196,61 @@ while True:
             delete_count = instance_count - args.max_instances
             for _ in range(delete_count):
                 inst = my_instances.pop()
-                logging.info(f"Destroying instance {inst['id']} (m: {inst['machine_id']} c: {inst['gpu_name']} g: {inst['geolocation']})")
+                logging.info(f"Destroying instance {inst_info(inst)}")
                 destroy_instance(id=inst['id'])
+                my_instances = [i for i in my_instances if i['id'] != inst['id']]
                 time.sleep(2)
         else:
-            pass
-            #logging.info(f'{instance_count} instances running (max is {args.max_instances}), waiting...')
-        
+            # Revise bids
+            for inst in run_instances(my_instances):
+                for offer in offers:
+                    if offer['machine_id'] == inst['machine_id']:
+                        if offer['bid'] + 0.01 < inst['dph_total']:
+                            logging.info(f"Updating bid {inst_info(offer)}")
+                            change_bid(id=inst['id'], price=offer['bid'])
+                            time.sleep(2)
+            
+            # Check for cheaper machines
+            # Find most expensive instance
+            ri = run_instances(my_instances)
+            ri.sort(key=lambda i: i['dph_base'], reverse=True)
+            most_expensive = None
+            if len(ri) > 0:
+                most_expensive = ri[0]
+            
+            swapped = False
+            if most_expensive is not None:
+                for offer in offers:
+                    if offer['machine_id'] in my_machine_ids:
+                        continue
+                    if offer['host_id'] in my_host_ids:
+                        continue
+                    if offer['bid'] < most_expensive['dph_base']:
+                        # Swap
+                        swapped = True
+                        logging.info(f"Swapping out {inst_info(most_expensive)}")
+                        destroy_instance(id=most_expensive['id'])
+                        my_instances = [i for i in my_instances if i['id'] != most_expensive['id']]
+                        time.sleep(2)
+                        logging.info(f"For instance {inst_info(offer)})")
+                        create_instance(id=offer['id'], price=offer['bid'], disk=args.disk_space, image=args.image, args=args.args.split(" "))
+            
+            if not swapped:
+                # Check for duplicates
+                machine_ids = {}
+                host_ids = {}
+    
+                for inst in my_instances:
+                    if inst['machine_id'] in machine_ids or inst['host_id'] in host_ids:
+                        # Destroy
+                        logging.info(f"Destroying duplicate {inst_info(inst)}")
+                        destroy_instance(id=inst['id'])
+                        time.sleep(2)
+                    machine_ids[inst['machine_id']] = True
+                    host_ids[inst['host_id']] = True
         # TODO: Check for actual_status['exited'] and destroy those instances
     except Exception as e:
         logging.error(str(e))
-
-    time.sleep(60)
+        
+    time.sleep(10)
 
