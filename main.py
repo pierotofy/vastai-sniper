@@ -96,63 +96,72 @@ show_instances = capture_json(show__instances)
 search_offers = capture_json(search__offers)
 create_instance = capture_json(create__instance)
 change_bid = capture_json(change__bid)
-destroy_instance = capture_json(destroy__instance
+destroy_instance = capture_json(destroy__instance)
 
-)
+
+def compute_bid(offers):
+    for o in offers:
+        # Compute bid
+        o['bid'] = o['min_bid'] + (args.disk_space * o['storage_cost'] / 30 / 24) + 0.02
+        # TODO: make spread a var?
+    return offers
+
 while True:
-    my_instances = show_instances()
+    try:
+        my_instances = compute_bid(show_instances())
 
-    run_instances = [i for i in my_instances if i['actual_status'] == 'running' or i['actual_status'] is None]
-    instance_count = len(run_instances)
+        run_instances = [i for i in my_instances if i['actual_status'] == 'running' or i['actual_status'] is None]
+        instance_count = len(run_instances)
 
-    if instance_count < args.max_instances:
-        offers = search_offers(type="bid", query=f"rentable=true rented=true disk_space >= {args.disk_space} min_bid < {args.max_bid}  {args.query}")
-        for o in offers:
-            # Compute bid
-            o['bid'] = o['min_bid'] + (args.disk_space * o['storage_cost'] / 30 / 24)
-            
-        offers.sort(key=lambda o: o['bid'])
+        # TODO: remove duplicate machine IDs!!
         
-        created_count = 0
-        created_target = args.max_instances - instance_count
-        for offer in offers:
-            if offer['bid'] > args.max_bid:
-                continue
-            if created_count >= created_target:
-                break
+        if instance_count < args.max_instances:
+            offers = compute_bid(search_offers(type="bid", query=f"rentable=true rented=true disk_space >= {args.disk_space} min_bid < {args.max_bid}  {args.query}"))
+            offers.sort(key=lambda o: o['bid'])
+            
+            created_count = 0
+            created_target = args.max_instances - instance_count
+            for offer in offers:
+                if offer['bid'] > args.max_bid:
+                    continue
+                if created_count >= created_target:
+                    break
 
-            found = False
-            for inst in my_instances:
-                if inst['machine_id'] == offer['machine_id']:
-                    found = True
-                    if inst['actual_status'] is None:
-                        # Wait, might be launching
-                        pass
-                    elif inst['actual_status'] != 'running':
-                        # Update bid
-                        logging.info(f"Updating bid (m: {offer['machine_id']} c: {offer['gpu_name']} g: {offer['geolocation']} bid: ${offer['bid']})")
-                        change_bid(id=inst['id'], price=offer['bid'])
-                        time.sleep(2)
-                    # TODO: update bid to lower cost?
-            if not found:
-                # Create
-                logging.info(f"Creating instance {offer['id']} (m: {offer['machine_id']} c: {offer['gpu_name']} g: {offer['geolocation']} bid: ${offer['bid']})")
+                found = False
+                for inst in my_instances:
+                    if inst['machine_id'] == offer['machine_id']:
+                        found = True
+                        if inst['actual_status'] is None:
+                            # Wait, might be launching
+                            pass
+                        elif inst['actual_status'] != 'running':
+                            # Update bid
+                            logging.info(f"Updating bid (m: {offer['machine_id']} c: {offer['gpu_name']} g: {offer['geolocation']} bid: ${offer['bid']})")
+                            change_bid(id=inst['id'], price=offer['bid'])
+                            time.sleep(2)
+                        # TODO: update bid to lower cost?
+                if not found:
+                    # Create
+                    logging.info(f"Creating instance {offer['id']} (m: {offer['machine_id']} c: {offer['gpu_name']} g: {offer['geolocation']} bid: ${offer['bid']})")
 
-                create_instance(id=offer['id'], price=offer['bid'], disk=args.disk_space, image=args.image, args=args.args.split(" "))
-                created_count += 1
+                    create_instance(id=offer['id'], price=offer['bid'], disk=args.disk_space, image=args.image, args=args.args.split(" "))
+                    created_count += 1
+                    time.sleep(2)
+        elif instance_count > args.max_instances:
+            my_instances.sort(key=lambda i: i['bid'])
+            delete_count = instance_count - args.max_instances
+            for _ in range(delete_count):
+                inst = my_instances.pop()
+                logging.info(f"Destroying instance {inst['id']} (m: {inst['machine_id']} c: {inst['gpu_name']} g: {inst['geolocation']})")
+                destroy_instance(id=inst['id'])
                 time.sleep(2)
-    elif instance_count > args.max_instances:
-        my_instances.sort(key=lambda i: i['bid'])
-        delete_count = instance_count - args.max_instances
-        for _ in range(delete_count):
-            inst = my_instances.pop()
-            logging.info(f"Destroying instance {inst['id']} (m: {inst['machine_id']} c: {inst['gpu_name']} g: {inst['geolocation']})")
-            destroy_instance(id=inst['id'])
-            time.sleep(2)
-    else:
-        logging.info(f'{instance_count} instances running (max is {args.max_instances}), waiting...')
-    
-    # Check for actual_status['exited'] and destroy those instances
+        else:
+            pass
+            #logging.info(f'{instance_count} instances running (max is {args.max_instances}), waiting...')
+        
+        # TODO: Check for actual_status['exited'] and destroy those instances
+    except Exception as e:
+        logging.error(str(e))
 
     time.sleep(60)
 
