@@ -164,6 +164,18 @@ while True:
         offers = compute_bid(search_offers(type="bid", query=f"rentable=true rented=true disk_space >= {args.disk_space} min_bid <= {args.max_bid}  {args.query}"))
         offers.sort(key=lambda o: o['bid'])
         offers = filter_instances(offers)
+
+        deleted_instances = []        
+        for inst in my_instances:
+            if inst['actual_status'] is None:
+                continue
+            
+            if inst['actual_status'] != 'running':
+                logging.info(f"Destroying idle instance {inst_info(inst)}")
+                destroy_instance(id=inst['id'])
+                deleted_instances.append(inst['id'])
+                time.sleep(5)
+        my_instances = [i for i in my_instances if i['id'] not in deleted_instances]
         
         if instance_count < args.max_instances:
             created_count = 0
@@ -179,18 +191,19 @@ while True:
                         if inst['actual_status'] is None:
                             # Wait, might be launching
                             pass
-                        elif inst['actual_status'] != 'running':
+                        # elif inst['actual_status'] != 'running':
                             # Update bid
-                            logging.info(f"Updating bid {inst_info(offer)})")
-                            change_bid(id=inst['id'], price=offer['bid'])
-                            time.sleep(2)
+                            # logging.info(f"Updating bid {inst_info(offer)})")
+                            # change_bid(id=inst['id'], price=offer['bid'])
+                            # time.sleep(5)
+          
                 if not found:
                     # Create
                     logging.info(f"Creating instance {inst_info(offer)})")
 
                     create_instance(id=offer['id'], price=offer['bid'], disk=args.disk_space, image=args.image, args=args.args.split(" "))
                     created_count += 1
-                    time.sleep(2)
+                    time.sleep(5)
         elif instance_count > args.max_instances:
             my_instances.sort(key=lambda i: i['bid'])
             delete_count = instance_count - args.max_instances
@@ -199,16 +212,16 @@ while True:
                 logging.info(f"Destroying instance {inst_info(inst)}")
                 destroy_instance(id=inst['id'])
                 my_instances = [i for i in my_instances if i['id'] != inst['id']]
-                time.sleep(2)
+                time.sleep(5)
         else:
             # Revise bids
             for inst in run_instances(my_instances):
                 for offer in offers:
                     if offer['machine_id'] == inst['machine_id']:
                         if offer['bid'] + 0.01 < inst['dph_total']:
-                            logging.info(f"Updating bid {inst_info(offer)}")
+                            logging.info(f"Revising bid {inst_info(offer)}")
                             change_bid(id=inst['id'], price=offer['bid'])
-                            time.sleep(2)
+                            time.sleep(5)
             
             # Check for cheaper machines
             # Find most expensive instance
@@ -231,7 +244,7 @@ while True:
                         logging.info(f"Swapping out {inst_info(most_expensive)}")
                         destroy_instance(id=most_expensive['id'])
                         my_instances = [i for i in my_instances if i['id'] != most_expensive['id']]
-                        time.sleep(2)
+                        time.sleep(5)
                         logging.info(f"For instance {inst_info(offer)})")
                         create_instance(id=offer['id'], price=offer['bid'], disk=args.disk_space, image=args.image, args=args.args.split(" "))
             
@@ -245,12 +258,12 @@ while True:
                         # Destroy
                         logging.info(f"Destroying duplicate {inst_info(inst)}")
                         destroy_instance(id=inst['id'])
-                        time.sleep(2)
+                        time.sleep(5)
                     machine_ids[inst['machine_id']] = True
                     host_ids[inst['host_id']] = True
         # TODO: Check for actual_status['exited'] and destroy those instances
     except Exception as e:
         logging.error(str(e))
         
-    time.sleep(10)
+    time.sleep(120)
 
