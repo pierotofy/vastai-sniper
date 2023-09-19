@@ -53,9 +53,18 @@ parser.add_argument('--gpu-blacklist',
     type=str,
     default="",
     help='Blacklist of GPUs (comma separated). Default: %(default)s')
+parser.add_argument('--machine-blacklist',
+    type=str,
+    default="",
+    help='Blacklist of machine IDs (comma separated). Default: %(default)s')
+parser.add_argument('--terminate',
+    action="store_true",
+    help='Terminate all instances')
+
 
 args = parser.parse_args()
 gpu_blacklist = [n.lower() for n in args.gpu_blacklist.split(",")]
+machine_blacklist = [int(n) for n in args.machine_blacklist.split(",")]
 
 if os.path.exists(api_key_file):
     with open(api_key_file, "r") as reader:
@@ -132,8 +141,13 @@ def filter_instances(offers):
             continue
         
         blacklisted = False
-        for bg in gpu_blacklist:
-            if bg in o['gpu_name'].lower():
+        for gb in gpu_blacklist:
+            if gb in o['gpu_name'].lower():
+                blacklisted = True
+                break
+        
+        for mb in machine_blacklist:
+            if mb == o['machine_id']:
                 blacklisted = True
                 break
         
@@ -153,7 +167,7 @@ def inst_info(inst):
 
 def run_instances(instances):
     return [i for i in instances if i['actual_status'] == 'running' or i['actual_status'] is None]
-        
+
 while True:
     try:
         my_instances = compute_bid(show_instances())
@@ -165,16 +179,19 @@ while True:
         offers.sort(key=lambda o: o['bid'])
         offers = filter_instances(offers)
 
-        deleted_instances = []        
+        deleted_instances = []
         for inst in my_instances:
-            if inst['actual_status'] is None:
+            if inst['actual_status'] is None and not args.terminate:
                 continue
             
-            if inst['actual_status'] != 'running':
+            if inst['actual_status'] != 'running' or args.terminate:
                 logging.info(f"Destroying idle instance {inst_info(inst)}")
                 destroy_instance(id=inst['id'])
                 deleted_instances.append(inst['id'])
-                time.sleep(5)
+                time.sleep(2)
+
+        if args.terminate:
+            exit(0)
         my_instances = [i for i in my_instances if i['id'] not in deleted_instances]
         
         if instance_count < args.max_instances:
@@ -266,5 +283,5 @@ while True:
     except Exception as e:
         logging.error(str(e))
         
-    time.sleep(120)
+    time.sleep(180)
 
